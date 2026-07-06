@@ -417,28 +417,61 @@ int finalizaInsert(char *nome, column *c, int tamTupla){
     strcpy(directory, connected.db_directory);
     strcat(directory, dicio.nArquivo);
 
-    if((dados = fopen(directory,"r+b")) == NULL){
-        printf("ERROR: cannot open file.\n");
-        return ERRO_ABRIR_ARQUIVO;
-	}
-    long int offset = ftell(dados);
-
-    tp_buffer *buffer;
-    if (objeto.lastBuffer == -1){
-        buffer = initBuffer(0);
-        objeto.lastBuffer = 0;
-        // se o insert falhar ele atualiza aqui e é problema para os futuros inserts.
-        updateSchema(&objeto); 
-    } else {
-        buffer = getBlock(objeto.lastBuffer, directory);
-        if(buffer == NULL) return ERRO_ABRIR_ARQUIVO;
-
-        if (buffer->position + tamTupla >= SIZE) {
-            buffer = initBuffer(objeto.lastBuffer + 1);
-            objeto.lastBuffer++;
-            updateSchema(&objeto); 
+    /* Garante que o BM global está inicializado */
+    if (global_buffer_manager == NULL) {
+        global_buffer_manager = BM_Init(16, SIZE);
+        if (global_buffer_manager == NULL) {
+            printf("ERROR: cannot initialize buffer manager.\n");
+            return ERRO_ABRIR_ARQUIVO;
         }
     }
+
+    /* Cria o arquivo se não existir */
+    if((dados = fopen(directory, "r+b")) == NULL) {
+        dados = fopen(directory, "w+b");
+        if (dados == NULL) {
+            printf("ERROR: cannot open file.\n");
+            return ERRO_ABRIR_ARQUIVO;
+        }
+    }
+
+    tp_buffer *buffer;
+    if (objeto.lastBuffer == -1) {
+        /* Primeira inserção: obtém a página 0 (nova, zerada) */
+        buffer = BM_GetPage(global_buffer_manager, directory, 0);
+        if (buffer == NULL) {
+            printf("ERROR: cannot get buffer page 0.\n");
+            fclose(dados);
+            return ERRO_ABRIR_ARQUIVO;
+        }
+        objeto.lastBuffer = 0;
+        updateSchema(&objeto);
+    } else {
+        buffer = BM_GetPage(global_buffer_manager, directory, (unsigned int)objeto.lastBuffer);
+        if (buffer == NULL) {
+            printf("ERROR: cannot get buffer page %d.\n", objeto.lastBuffer);
+            fclose(dados);
+            return ERRO_ABRIR_ARQUIVO;
+        }
+        if (buffer->position + tamTupla > SIZE) {
+            /* Página cheia: despin e avança para a próxima */
+            BM_UnpinPage(global_buffer_manager, directory, (unsigned int)objeto.lastBuffer);
+            objeto.lastBuffer++;
+            buffer = BM_GetPage(global_buffer_manager, directory, (unsigned int)objeto.lastBuffer);
+            if (buffer == NULL) {
+                printf("ERROR: cannot get buffer page %d.\n", objeto.lastBuffer);
+                fclose(dados);
+                return ERRO_ABRIR_ARQUIVO;
+            }
+            updateSchema(&objeto);
+        }
+    }
+    /* Registra o arquivo no frame para que o flush funcione */
+    strncpy(buffer->filename, directory, sizeof(buffer->filename) - 1);
+    buffer->filename[sizeof(buffer->filename) - 1] = '\0';
+
+    /* Offset lógico para o índice B+ (posição da tupla no arquivo) */
+    long int offset = (long int)objeto.lastBuffer * SIZE + (long int)buffer->position;
 
     // fputc(0, dados); // flag para tupla não deletada
 
@@ -501,10 +534,10 @@ int finalizaInsert(char *nome, column *c, int tamTupla){
                 goto fim;
             }
 
-            char valorCampo[auxT[t].tam + 1];
+            char valorCampo[auxT[t].tam];
             strncpy(valorCampo, auxC->valorCampo, auxT[t].tam);
             //strcat(valorCampo, "\0");
-             valorCampo[auxT[t].tam] = 0;
+             valorCampo[auxT[t].tam -1 ] = 0;
             memcpy(bufferTuple + offsetBuffer, valorCampo, auxT[t].tam);
             offsetBuffer += auxT[t].tam;
         }
@@ -525,29 +558,21 @@ int finalizaInsert(char *nome, column *c, int tamTupla){
             DEBUG_PRINT("INSERT - Integer value written in file: %d", valorInteiro);
         }
         else if (auxT[t].tipo == 'D'){ // Grava um dado do tipo double.
-        x = 0;
-        while (x < strlen(auxC->valorCampo)){
-            if((auxC->valorCampo[x] < 48 || auxC->valorCampo[x] > 57) && (auxC->valorCampo[x] != 46) && (auxC->valorCampo[x] != 45)){
-                printf("ERROR: column \"%s\" expect double.\n", auxC->nomeCampo);
-                erro = ERRO_NO_TIPO_DOUBLE;
-                goto fim;
-            }
-            x++;
-        }
+          x = 0;
+          while (x < strlen(auxC->valorCampo)){
+              if((auxC->valorCampo[x] < 48 || auxC->valorCampo[x] > 57) && (auxC->valorCampo[x] != 46) && (auxC->valorCampo[x] != 45)){
+                  printf("ERROR: column \"%s\" expect double.\n", auxC->nomeCampo);
+                  erro = ERRO_NO_TIPO_DOUBLE;
+                  goto fim;
+              }
+              x++;
+          }
+          char *endptr;
+          double valorDouble = strtod(auxC->valorCampo, &endptr);
 
-        errno = 0;
 
-        char *endptr;
-        double valorDouble = strtod(auxC->valorCampo, &endptr);
-
-        if (errno == ERANGE || valorDouble == HUGE_VAL || valorDouble == -HUGE_VAL) {
-            printf("ERROR: column \"%s\" double value out of range.\n", auxC->nomeCampo);
-            erro = ERRO_NO_TIPO_DOUBLE;
-            goto fim;
-        }
-
-        memcpy(bufferTuple + offsetBuffer, &valorDouble, sizeof(double));
-        offsetBuffer += sizeof(valorDouble);
+          memcpy(bufferTuple + offsetBuffer, &valorDouble, sizeof(double));
+          offsetBuffer += sizeof(valorDouble);
         }
         else if (auxT[t].tipo == 'C'){ // Grava um dado do tipo char.
 
@@ -568,9 +593,12 @@ int finalizaInsert(char *nome, column *c, int tamTupla){
     memcpy(buffer->data + buffer->position, bufferTuple, tamTupla);
     buffer->position += tamTupla;
     DEBUG_PRINT("INSERT - Tuple size written in file: %d", tamTupla);
-    fseek(dados, buffer->id * sizeof(tp_buffer), SEEK_SET);
-    fwrite(buffer, sizeof(tp_buffer), 1, dados);
-    DEBUG_PRINT("INSERT - Block size written in file: %d",  sizeof(tp_buffer));
+
+    /* Marca a página como suja e grava no disco via BufferManager */
+    BM_MarkDirty(global_buffer_manager, directory, buffer->id);
+    BM_FlushPage(global_buffer_manager, directory, buffer->id);
+    BM_UnpinPage(global_buffer_manager, directory, buffer->id);
+    DEBUG_PRINT("INSERT - Block flushed via BufferManager, page %u", buffer->id);
 
     fim: //label para liberar a memória utilizada e fechar o arquivo de dados
         fclose(dados);
@@ -591,11 +619,6 @@ void insert(rc_insert *s_insert) {
 	memset(&objeto, 0, sizeof(struct fs_objects));
 	char  flag=0;
 
-    if (!verificaNomeTabela(s_insert->objName)) {
-        printf("ERROR: table \"%s\" does not exist.\n", s_insert->objName);
-        return;
-    }
-
 	abreTabela(s_insert->objName, &objeto, &tabela->esquema); //retorna o esquema para a insere valor
 	strcpylower(tabela->nome, s_insert->objName);
 
@@ -605,13 +628,7 @@ void insert(rc_insert *s_insert) {
 		if (allColumnsExists(s_insert, tabela)){
 			for (esquema = tabela->esquema; esquema != NULL; esquema = esquema->next){
 				if(typesCompatible(esquema->tipo,getInsertedType(s_insert, esquema->nome, tabela))){
-				    char *valor = getInsertedValue(s_insert, esquema->nome, tabela);
-				    if (esquema->tipo == 'S' && valor != NULL && valor != COLUNA_NULL && (int)strlen(valor) > esquema->tam) {
-				        printf("ERROR: value too long for column \"%s\" (max: %d, received: %d).\n", esquema->nome, esquema->tam, (int)strlen(valor));
-				        flag=1;
-				    } else {
-				        colunas = insereValor(tabela, colunas, esquema->nome, valor);
-				    }
+					colunas = insereValor(tabela, colunas, esquema->nome, getInsertedValue(s_insert, esquema->nome, tabela));
 				}
         else {
 					printf("ERROR: data type invalid to column '%s' of relation '%s' (expected: %c, received: %c).\n", esquema->nome, tabela->nome, esquema->tipo, getInsertedType(s_insert, esquema->nome, tabela));
@@ -637,12 +654,7 @@ void insert(rc_insert *s_insert) {
 				}
 
 				if(s_insert->type[i] == tabela->esquema[i].tipo)
-				    if (tabela->esquema[i].tipo == 'S' && s_insert->values[i] != NULL && s_insert->values[i] != COLUNA_NULL && (int)strlen(s_insert->values[i]) > tabela->esquema[i].tam) {
-				        printf("ERROR: value too long for column \"%s\" (max: %d, received: %d).\n", tabela->esquema[i].nome, tabela->esquema[i].tam, (int)strlen(s_insert->values[i]));
-				        flag=1;
-				    } else {
-				        colunas = insereValor(tabela, colunas, tabela->esquema[i].nome, s_insert->values[i]);
-				    }
+					colunas = insereValor(tabela, colunas, tabela->esquema[i].nome, s_insert->values[i]);
 				else {
 					printf("ERROR: data type invalid to column '%s' of relation '%s' (expected: %c, received: %c).\n", tabela->esquema[i].nome, tabela->nome, tabela->esquema[i].tipo, s_insert->type[i]);
 					flag=1;
@@ -668,8 +680,8 @@ int validaProj(Lista *proj, tp_table *colunas, int qtdColunas, int *indiceProj){
         rmvNodoPtr(proj, proj->prim);
         proj->prim = proj->ult = NULL;
         for(int j = 0; j < qtdColunas; j++){
-            indiceProj[j] = j; //corrigido o (char)
-            char *str = uffslloc(sizeof(char) * strlen(colunas[j].nome));
+            indiceProj[j] = (char) j;
+            char *str = uffslloc(TAMANHO_NOME_CAMPO);
             strcpy(str, colunas[j].nome);
             adcNodo(proj, proj->ult, str);
         }
@@ -701,7 +713,7 @@ int validaProj(Lista *proj, tp_table *colunas, int qtdColunas, int *indiceProj){
 inf_where *novoTokenWhere(char *str,int id){
   inf_where *novo = uffslloc(sizeof(inf_where));
   novo->id = id;
-  char *tk = uffslloc(sizeof(char)*strlen(str));
+  char *tk = uffslloc(sizeof(char)*(strlen(str)+1));
   strcpy(tk,str);
   novo->token = (void *)tk;
   return novo;
@@ -864,9 +876,7 @@ void op_delete(Lista *toDeleteTuples, char *tabelaName) {
     }
 
     // write the last buffer 
-    if(buffer != NULL){
-        writeBufferToDisk(buffer, &objeto);
-    }
+    writeBufferToDisk(buffer, &objeto);
     printf("DELETED %d %s\n", countDeletedTuples, (countDeletedTuples != 1) ? "rows" : "row");
 }
 
@@ -1110,7 +1120,8 @@ Lista *handleTableOperation(inf_query *query, char tipo) {
 
     int *indiceProj = NULL, qtdCamposProj = 0;
     if(tipo == 's') {
-        indiceProj = (int *)uffslloc(sizeof(int) * objeto.qtdCampos); //corigido o parametro
+        /* Aloca com objeto.qtdCampos para suportar SELECT * que expande para todos os campos */
+        indiceProj = (int *)uffslloc(sizeof(int) * objeto.qtdCampos);
         if(!validaProj(query->proj, esquema, objeto.qtdCampos, indiceProj)){
             return NULL;
         }
@@ -1129,6 +1140,8 @@ Lista *handleTableOperation(inf_query *query, char tipo) {
             printf("ERROR: could not open the table.\n");
             return NULL;
         }
+        /* Página vazia (nenhuma tupla ainda) é normal — apenas pula */
+        if(pagina == NULL) continue;
         for(k = 0; k < pagina->nrec; k++){
             tupla *currentTuple = &pagina->tuplas[k];
             char satisfies = 0;
